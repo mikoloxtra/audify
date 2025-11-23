@@ -1,0 +1,7 @@
+{
+  "name": "Audify - Intelligent Audiobook Converter",
+  "description": "Convert documents to lifelike audiobooks using Gemini AI. Features secure storage, voice controls, and progress tracking.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
