@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Document, AppSettings, Note, VoiceGender } from '../types';
 import { generateSpeech } from '../services/geminiService';
 import { saveDocument, uploadAudioCache } from '../services/storageService';
+import { storage } from '../services/firebase';
+import { ref, getBytes } from 'firebase/storage';
 import { Button } from './Button';
 import { 
   Play, Pause, SkipBack, SkipForward, Settings, 
@@ -220,11 +222,11 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
       let base64: string;
       
       // Check if audio is already cached
-      if (doc.audioUrls && doc.audioUrls[index]) {
+      if (doc.audioPaths && doc.audioPaths[index]) {
         console.log(`[Player] Using cached audio for paragraph ${index}`);
-        // Fetch cached audio from Firebase Storage
-        const response = await fetch(doc.audioUrls[index]);
-        const arrayBuffer = await response.arrayBuffer();
+        // Fetch cached audio from Firebase Storage using SDK (no CORS issues)
+        const storageRef = ref(storage, doc.audioPaths[index]);
+        const arrayBuffer = await getBytes(storageRef);
         base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
       } else {
         console.log(`[Player] Generating new audio for paragraph ${index}`);
@@ -234,15 +236,17 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
         // Cache the audio in Firebase Storage
         const pcmBytes = decode(base64);
         const audioBlob = new Blob([pcmBytes], { type: 'application/octet-stream' });
-        const audioUrl = await uploadAudioCache(doc.userId, doc.id, index, audioBlob);
+        const { storagePath, downloadURL } = await uploadAudioCache(doc.userId, doc.id, index, audioBlob);
         
-        // Update document with cached audio URL
+        // Update document with cached audio path and URL
+        const updatedAudioPaths = [...(doc.audioPaths || [])];
         const updatedAudioUrls = [...(doc.audioUrls || [])];
-        updatedAudioUrls[index] = audioUrl;
-        const updatedDoc = { ...doc, audioUrls: updatedAudioUrls };
+        updatedAudioPaths[index] = storagePath;
+        updatedAudioUrls[index] = downloadURL;
+        const updatedDoc = { ...doc, audioPaths: updatedAudioPaths, audioUrls: updatedAudioUrls };
         await saveDocument(updatedDoc);
         setDoc(updatedDoc);
-        console.log(`[Player] Cached audio URL for paragraph ${index}`);
+        console.log(`[Player] Cached audio for paragraph ${index}`);
       }
       
       if (!audioCtxRef.current) return;

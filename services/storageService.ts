@@ -82,10 +82,10 @@ export const uploadAudioCache = async (
   documentId: string,
   paragraphIndex: number,
   audioBlob: Blob
-): Promise<string> => {
+): Promise<{ storagePath: string; downloadURL: string }> => {
   const storagePath = `users/${userId}/audio/${documentId}/paragraph-${paragraphIndex}.pcm`;
   const storageRef = ref(storage, storagePath);
   await uploadBytes(storageRef, audioBlob);
   const downloadURL = await getDownloadURL(storageRef);
-  return downloadURL;
+  return { storagePath, downloadURL };
 };
