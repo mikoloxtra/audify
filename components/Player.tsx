@@ -27,6 +27,17 @@ function decode(base64: string) {
   return bytes;
 }
 
+function encode(bytes: Uint8Array): string {
+  // Convert Uint8Array to base64 in chunks to avoid stack overflow
+  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
 async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext,
@@ -227,7 +238,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
         // Fetch cached audio from Firebase Storage using SDK (no CORS issues)
         const storageRef = ref(storage, doc.audioPaths[index]);
         const arrayBuffer = await getBytes(storageRef);
-        base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+        base64 = encode(new Uint8Array(arrayBuffer));
       } else {
         console.log(`[Player] Generating new audio for paragraph ${index}`);
         const text = doc.paragraphs[index];
