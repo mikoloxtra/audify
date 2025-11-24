@@ -7,25 +7,32 @@ export interface User {
 
 export interface Note {
   id: string;
-  paragraphIndex: number; // The index of the paragraph
+  pageNumber: number; // Which page this note belongs to
+  paragraphIndex: number; // The index of the paragraph within the page
   timestamp: number; // Seconds relative to the start of the paragraph
   content: string;
   createdAt: string;
+}
+
+export interface Page {
+  pageNumber: number; // 1-indexed page number
+  imageUrl: string; // Download URL for the page image
+  imagePath: string; // Storage path for the page image
+  text: string; // Full OCR text for this page
+  paragraphs: string[]; // Split paragraphs for this page
+  audioPaths: string[]; // Storage paths for cached audio per paragraph
+  audioUrls: string[]; // Download URLs for cached audio per paragraph
 }
 
 export interface Document {
   id: string;
   userId: string;
   title: string;
-  content: string; // Full text content (cached from OCR)
-  paragraphs: string[]; // Split content for easier TTS chunking
-  audioUrls?: string[]; // Cached TTS audio URLs per paragraph in Firebase Storage
-  audioPaths?: string[]; // Storage paths for cached audio (used for direct SDK access)
-  progressIndex: number; // Current paragraph index
+  pages: Page[]; // Array of pages in the document
+  currentPage: number; // Current page number (1-indexed)
+  currentParagraph: number; // Current paragraph index within current page
   createdAt: string;
   updatedAt?: string;
-  sourceImagePath?: string; // Path in Firebase Storage
-  sourceImageUrl?: string; // Download URL for display
   notes: Note[];
 }
 

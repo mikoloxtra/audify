@@ -17,7 +17,7 @@ export const saveDocument = async (document: Document): Promise<void> => {
   const documentRef = doc(db, 'documents', document.id);
   const payload: Document = {
     ...document,
-    paragraphs: document.paragraphs ?? [],
+    pages: document.pages ?? [],
     notes: document.notes ?? [],
     updatedAt: new Date().toISOString(),
   };
@@ -33,7 +33,7 @@ export const getUserDocuments = async (userId: string): Promise<Document[]> => {
     return {
       id: docSnap.id,
       ...data,
-      paragraphs: (data.paragraphs as string[] | undefined) ?? [],
+      pages: (data.pages as any[] | undefined) ?? [],
       notes: (data.notes as any[] | undefined) ?? [],
     } as Document;
   });

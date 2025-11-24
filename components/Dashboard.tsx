@@ -88,13 +88,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onScanNew, onOpenDoc
                         <PlayCircle className="w-6 h-6" />
                     </div>
                     <div>
-                        <h3 className="font-semibold text-slate-900 mb-1">{doc.title}</h3>
-                        <div className="flex items-center gap-3 text-xs text-slate-400">
-                            <span className="flex items-center"><Clock className="w-3 h-3 mr-1"/> {new Date(doc.createdAt).toLocaleDateString()}</span>
-                            <span>•</span>
-                            <span>{Math.round(((doc.progressIndex || 0) / doc.paragraphs.length) * 100)}% Completed</span>
-                        </div>
-                    </div>
+                       <h3 className="font-semibold text-slate-900 mb-1">{doc.title}</h3>
+                       <div className="flex items-center gap-3 text-xs text-slate-400">
+                           <span className="flex items-center"><Clock className="w-3 h-3 mr-1"/> {new Date(doc.createdAt).toLocaleDateString()}</span>
+                           <span>•</span>
+                           <span>{doc.pages.length} page{doc.pages.length !== 1 ? 's' : ''}</span>
+                           <span>•</span>
+                           <span>Page {doc.currentPage || 1}</span>
+                       </div>
+                   </div>
                  </div>
                  
                  <button 
