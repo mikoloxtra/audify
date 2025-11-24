@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Document, AppSettings, Note, VoiceGender } from '../types';
 import { generateSpeech } from '../services/geminiService';
-import { saveDocument } from '../services/storageService';
+import { saveDocument, uploadAudioCache } from '../services/storageService';
 import { Button } from './Button';
 import { 
   Play, Pause, SkipBack, SkipForward, Settings, 
@@ -217,8 +217,33 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     }
 
     try {
-      const text = doc.paragraphs[index];
-      const base64 = await generateSpeech(text, settings.voiceGender);
+      let base64: string;
+      
+      // Check if audio is already cached
+      if (doc.audioUrls && doc.audioUrls[index]) {
+        console.log(`[Player] Using cached audio for paragraph ${index}`);
+        // Fetch cached audio from Firebase Storage
+        const response = await fetch(doc.audioUrls[index]);
+        const arrayBuffer = await response.arrayBuffer();
+        base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      } else {
+        console.log(`[Player] Generating new audio for paragraph ${index}`);
+        const text = doc.paragraphs[index];
+        base64 = await generateSpeech(text, settings.voiceGender);
+        
+        // Cache the audio in Firebase Storage
+        const pcmBytes = decode(base64);
+        const audioBlob = new Blob([pcmBytes], { type: 'application/octet-stream' });
+        const audioUrl = await uploadAudioCache(doc.userId, doc.id, index, audioBlob);
+        
+        // Update document with cached audio URL
+        const updatedAudioUrls = [...(doc.audioUrls || [])];
+        updatedAudioUrls[index] = audioUrl;
+        const updatedDoc = { ...doc, audioUrls: updatedAudioUrls };
+        await saveDocument(updatedDoc);
+        setDoc(updatedDoc);
+        console.log(`[Player] Cached audio URL for paragraph ${index}`);
+      }
       
       if (!audioCtxRef.current) return;
 
@@ -245,7 +270,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     } finally {
       setIsLoadingAudio(false);
     }
-  }, [doc.paragraphs, settings.voiceGender]);
+  }, [doc, settings.voiceGender]);
 
   // Initial load and Paragraph change handling
   useEffect(() => {

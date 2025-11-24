@@ -3,6 +3,9 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { db, storage } from './firebase';
 import { AppSettings, Document, VoiceGender } from '../types';
 
+// File size limit: 10MB per image
+export const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
 const DEFAULT_SETTINGS: AppSettings = {
   voiceGender: VoiceGender.FEMALE,
   playbackSpeed: 1.0,
@@ -62,10 +65,27 @@ export const uploadSourceAsset = async (
   userId: string,
   file: File
 ): Promise<{ storagePath: string; downloadURL: string }> => {
+  if (file.size > MAX_FILE_SIZE) {
+    throw new Error(`File size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit`);
+  }
+
   const storagePath = `users/${userId}/uploads/${Date.now()}-${file.name}`;
   const storageRef = ref(storage, storagePath);
   await uploadBytes(storageRef, file);
   const downloadURL = await getDownloadURL(storageRef);
 
   return { storagePath, downloadURL };
+};
+
+export const uploadAudioCache = async (
+  userId: string,
+  documentId: string,
+  paragraphIndex: number,
+  audioBlob: Blob
+): Promise<string> => {
+  const storagePath = `users/${userId}/audio/${documentId}/paragraph-${paragraphIndex}.pcm`;
+  const storageRef = ref(storage, storagePath);
+  await uploadBytes(storageRef, audioBlob);
+  const downloadURL = await getDownloadURL(storageRef);
+  return downloadURL;
 };

@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { extractTextFromImage } from '../services/geminiService';
 import { User, Document } from '../types';
-import { saveDocument, uploadSourceAsset } from '../services/storageService';
+import { saveDocument, uploadSourceAsset, MAX_FILE_SIZE } from '../services/storageService';
 import { Button } from './Button';
 import { v4 as uuidv4 } from 'uuid';
 import { Upload, FileText, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
@@ -42,6 +42,10 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
     if (selectedFile) {
       if (!selectedFile.type.startsWith('image/')) {
         setError('Please select a valid image file (JPG, PNG).');
+        return;
+      }
+      if (selectedFile.size > MAX_FILE_SIZE) {
+        setError(`File size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit. Please choose a smaller image.`);
         return;
       }
       setFile(selectedFile);

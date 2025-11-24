@@ -17,8 +17,9 @@ export interface Document {
   id: string;
   userId: string;
   title: string;
-  content: string; // Full text content
+  content: string; // Full text content (cached from OCR)
   paragraphs: string[]; // Split content for easier TTS chunking
+  audioUrls?: string[]; // Cached TTS audio URLs per paragraph in Firebase Storage
   progressIndex: number; // Current paragraph index
   createdAt: string;
   updatedAt?: string;
