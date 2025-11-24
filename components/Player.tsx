@@ -94,11 +94,6 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   const audioBufferRef = useRef<AudioBuffer | null>(null);
   const isManualStopRef = useRef<boolean>(false);
   
-  // Page-based audio tracking
-  const pageAudioBuffersRef = useRef<AudioBuffer[]>([]); // All buffers for current page
-  const pageDurationsRef = useRef<number[]>([]); // Duration of each paragraph
-  const pageTotalDurationRef = useRef<number>(0); // Total duration of page
-  
   // Time Tracking Refs
   const startTimeRef = useRef<number>(0); // AudioContext time when playback started
   const currentBufferOffsetRef = useRef<number>(0); // Offset in seconds within current buffer
@@ -142,31 +137,17 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPageIndex, currentParaIndex]);
 
-  // Calculate cumulative time up to current paragraph
-  const getCumulativeTimeBeforeParagraph = useCallback((paraIdx: number): number => {
-    let cumulative = 0;
-    for (let i = 0; i < paraIdx && i < pageDurationsRef.current.length; i++) {
-      cumulative += pageDurationsRef.current[i];
-    }
-    return cumulative;
-  }, []);
-
-  // Animation Loop for Progress Bar (page-based)
+  // Animation Loop for Progress Bar
   const updateProgress = useCallback(() => {
     if (audioCtxRef.current && isPlaying && duration > 0) {
        const elapsed = audioCtxRef.current.currentTime - startTimeRef.current;
-       // Calculate current position in current paragraph buffer
-       const currentParaPos = currentBufferOffsetRef.current + (elapsed * settings.playbackSpeed);
-       
-       // Add cumulative time from previous paragraphs
-       const cumulativeTime = getCumulativeTimeBeforeParagraph(currentParaIndex);
-       const totalTime = cumulativeTime + currentParaPos;
-       
-       setPlaybackTime(Math.min(totalTime, duration));
+       // Calculate current position in buffer: startOffset + (elapsed * speed)
+       const currentPos = currentBufferOffsetRef.current + (elapsed * settings.playbackSpeed);
+       setPlaybackTime(Math.min(currentPos, duration));
        
        rafRef.current = requestAnimationFrame(updateProgress);
     }
-  }, [isPlaying, settings.playbackSpeed, duration, currentParaIndex, getCumulativeTimeBeforeParagraph]);
+  }, [isPlaying, settings.playbackSpeed, duration]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -225,115 +206,22 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   };
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!duration || pageDurationsRef.current.length === 0) return;
+      if (!duration) return;
       
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const percent = Math.min(1, Math.max(0, x / rect.width));
       const newTime = percent * duration;
 
-      // Find which paragraph this time falls into
-      let cumulative = 0;
-      let targetParaIdx = 0;
-      let offsetInPara = 0;
-      
-      for (let i = 0; i < pageDurationsRef.current.length; i++) {
-        if (newTime <= cumulative + pageDurationsRef.current[i]) {
-          targetParaIdx = i;
-          offsetInPara = newTime - cumulative;
-          break;
-        }
-        cumulative += pageDurationsRef.current[i];
-      }
-      
-      // If we're seeking to a different paragraph, switch to it
-      if (targetParaIdx !== currentParaIndex) {
-        setCurrentParaIndex(targetParaIdx);
-        audioBufferRef.current = pageAudioBuffersRef.current[targetParaIdx];
-      }
-      
-      currentBufferOffsetRef.current = offsetInPara;
+      currentBufferOffsetRef.current = newTime;
       setPlaybackTime(newTime);
 
       if (isPlaying && audioBufferRef.current) {
-          playBufferedAudio(offsetInPara);
+          playBufferedAudio(newTime);
       }
   };
 
-  // Load all audio for the current page
-  const loadPageAudio = useCallback(async (pageIdx: number) => {
-    const page = doc.pages[pageIdx];
-    if (!page) return;
-
-    console.log(`[Player] Loading all audio for page ${pageIdx + 1}`);
-    setIsLoadingAudio(true);
-    setAudioError(null);
-
-    try {
-      const buffers: AudioBuffer[] = [];
-      const durations: number[] = [];
-      
-      // Load audio for each paragraph in the page
-      for (let paraIdx = 0; paraIdx < page.paragraphs.length; paraIdx++) {
-        let base64: string;
-        
-        // Check if audio is cached
-        if (page.audioPaths && page.audioPaths[paraIdx]) {
-          console.log(`[Player] Using cached audio for page ${pageIdx + 1}, para ${paraIdx}`);
-          const storageRef = ref(storage, page.audioPaths[paraIdx]);
-          const arrayBuffer = await getBytes(storageRef);
-          base64 = encode(new Uint8Array(arrayBuffer));
-        } else {
-          console.log(`[Player] Generating audio for page ${pageIdx + 1}, para ${paraIdx}`);
-          const text = page.paragraphs[paraIdx];
-          base64 = await generateSpeech(text, settings.voiceGender);
-          
-          // Cache the audio
-          const pcmBytes = decode(base64);
-          const audioBlob = new Blob([pcmBytes], { type: 'application/octet-stream' });
-          const { storagePath, downloadURL } = await uploadAudioCache(doc.userId, doc.id, paraIdx, audioBlob);
-          
-          // Update page with cached audio
-          const updatedPages = [...doc.pages];
-          const updatedAudioPaths = [...(page.audioPaths || [])];
-          const updatedAudioUrls = [...(page.audioUrls || [])];
-          updatedAudioPaths[paraIdx] = storagePath;
-          updatedAudioUrls[paraIdx] = downloadURL;
-          updatedPages[pageIdx] = { ...page, audioPaths: updatedAudioPaths, audioUrls: updatedAudioUrls };
-          const updatedDoc = { ...doc, pages: updatedPages };
-          await saveDocument(updatedDoc);
-          setDoc(updatedDoc);
-        }
-        
-        if (!audioCtxRef.current) return;
-        
-        // Decode audio
-        const pcmBytes = decode(base64);
-        const audioBuffer = await decodeAudioData(pcmBytes, audioCtxRef.current, 24000, 1);
-        
-        buffers.push(audioBuffer);
-        durations.push(audioBuffer.duration);
-      }
-      
-      // Store page audio data
-      pageAudioBuffersRef.current = buffers;
-      pageDurationsRef.current = durations;
-      pageTotalDurationRef.current = durations.reduce((sum, d) => sum + d, 0);
-      
-      // Set duration to total page duration
-      setDuration(pageTotalDurationRef.current);
-      
-      console.log(`[Player] Loaded ${buffers.length} paragraphs, total duration: ${pageTotalDurationRef.current.toFixed(2)}s`);
-      
-    } catch (error: any) {
-      console.error('[Player] Failed to load page audio', error);
-      setAudioError(error.message || 'Failed to load audio for this page.');
-    } finally {
-      setIsLoadingAudio(false);
-    }
-  }, [doc, settings.voiceGender]);
-
-  // Load Audio for current paragraph (legacy - kept for compatibility)
+  // Load Audio for current paragraph
   const loadAudioForParagraph = useCallback(async (pageIdx: number, paraIdx: number, autoPlay: boolean, initialOffset: number = 0) => {
     const page = doc.pages[pageIdx];
     if (!page || paraIdx >= page.paragraphs.length) {
@@ -412,51 +300,18 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     }
   }, [doc, settings.voiceGender]);
 
-  // Initial page load - load all audio for the page
+  // Initial load and page/paragraph change handling
   useEffect(() => {
-    if (pageAudioBuffersRef.current.length === 0 && !isLoadingAudio) {
-      loadPageAudio(currentPageIndex).then(() => {
-        if (pageAudioBuffersRef.current[currentParaIndex]) {
-          audioBufferRef.current = pageAudioBuffersRef.current[currentParaIndex];
-          if (isPlaying) {
-            playBufferedAudio(0);
-          }
-        }
-      });
+    if (!audioBufferRef.current && !isLoadingAudio) {
+      loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPageIndex]);
+  }, [currentPageIndex, currentParaIndex]);
   
-  // When paragraph changes within the same page, switch buffer
+  // Reload if voice gender changes
   useEffect(() => {
-    if (pageAudioBuffersRef.current.length > 0 && pageAudioBuffersRef.current[currentParaIndex]) {
-      audioBufferRef.current = pageAudioBuffersRef.current[currentParaIndex];
-      const cumulativeTime = getCumulativeTimeBeforeParagraph(currentParaIndex);
-      setPlaybackTime(cumulativeTime);
-      currentBufferOffsetRef.current = 0;
-      
-      if (isPlaying) {
-        playBufferedAudio(0);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentParaIndex]);
-  
-  // Reload page audio if voice gender changes
-  useEffect(() => {
-    pageAudioBuffersRef.current = [];
     audioBufferRef.current = null;
-    loadPageAudio(currentPageIndex).then(() => {
-      if (pageAudioBuffersRef.current[currentParaIndex]) {
-        audioBufferRef.current = pageAudioBuffersRef.current[currentParaIndex];
-        const cumulativeTime = getCumulativeTimeBeforeParagraph(currentParaIndex);
-        if (isPlaying) {
-          playBufferedAudio(0);
-        } else {
-          setPlaybackTime(cumulativeTime);
-        }
-      }
-    });
+    loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying, playbackTime);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.voiceGender]);
 
@@ -505,14 +360,8 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   const handlePlay = () => {
     if (audioBufferRef.current) {
       playBufferedAudio();
-    } else if (pageAudioBuffersRef.current.length === 0) {
-      // Load page audio if not loaded yet
-      loadPageAudio(currentPageIndex).then(() => {
-        if (pageAudioBuffersRef.current[currentParaIndex]) {
-          audioBufferRef.current = pageAudioBuffersRef.current[currentParaIndex];
-          playBufferedAudio(0);
-        }
-      });
+    } else {
+      loadAudioForParagraph(currentPageIndex, currentParaIndex, true);
     }
   };
 
@@ -541,35 +390,26 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   const handleAudioEnded = () => {
     // If we hit the end of the current paragraph buffer naturally
     currentBufferOffsetRef.current = 0;
+    setPlaybackTime(duration);
     
     const currentPageParagraphs = doc.pages[currentPageIndex]?.paragraphs || [];
     
     // Check if there's a next paragraph in current page
     if (currentParaIndex < currentPageParagraphs.length - 1) {
-      // Move to next paragraph within the same page
-      const nextParaIdx = currentParaIndex + 1;
-      setCurrentParaIndex(nextParaIdx);
-      
-      // Buffer should already be loaded from page load
-      if (pageAudioBuffersRef.current[nextParaIdx]) {
-        audioBufferRef.current = pageAudioBuffersRef.current[nextParaIdx];
-        playBufferedAudio(0);
-      }
+      setCurrentParaIndex(prev => prev + 1);
+      audioBufferRef.current = null;
+      setTimeout(() => loadAudioForParagraph(currentPageIndex, currentParaIndex + 1, true), 0);
     } 
     // Check if there's a next page
     else if (currentPageIndex < doc.pages.length - 1) {
-      // Move to next page - need to load new page audio
       setCurrentPageIndex(prev => prev + 1);
       setCurrentParaIndex(0);
-      pageAudioBuffersRef.current = []; // Clear current page buffers
       audioBufferRef.current = null;
-      // The useEffect will trigger loadPageAudio for the new page
+      setTimeout(() => loadAudioForParagraph(currentPageIndex + 1, 0, true), 0);
     } 
     // End of document
     else {
       setIsPlaying(false);
-      const totalTime = pageTotalDurationRef.current;
-      setPlaybackTime(totalTime);
     }
   };
 
