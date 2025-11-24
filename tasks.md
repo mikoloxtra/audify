@@ -14,3 +14,7 @@
 - Add Testing for all the features so far
 - Add a link to ilovepdf to convert pdf to images or shrink document size or any other thing users might need before uploading to audify
 - Add share link feature for users to share the link of audify with others
+- Save user notes and timestamp to firebase
+- Playback should autocontinue after user saves a note
+- audio note feature should work, recording should work the way voice notes work in whatsapp all data should be stored in db, lets brainstorm how transcribing should work whether to use gemini or some API
+- For multiple books/pages, do a pro/con list of allowing users batch upload multiple files and making the logic to scan all of them or calling smallpdf api to sqash them into one file and then scanning it.

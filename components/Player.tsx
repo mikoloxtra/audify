@@ -72,7 +72,8 @@ interface PlayerProps {
 
 export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, onUpdateSettings, onBack }) => {
   const [doc, setDoc] = useState(initialDoc);
-  const [currentParaIndex, setCurrentParaIndex] = useState(doc.progressIndex || 0);
+  const [currentPageIndex, setCurrentPageIndex] = useState((doc.currentPage || 1) - 1); // Convert to 0-indexed
+  const [currentParaIndex, setCurrentParaIndex] = useState(doc.currentParagraph || 0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
@@ -98,6 +99,10 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   const currentBufferOffsetRef = useRef<number>(0); // Offset in seconds within current buffer
   const rafRef = useRef<number | null>(null); // Request Animation Frame
 
+  // Helper to get current page
+  const currentPage = doc.pages[currentPageIndex];
+  const currentParagraphs = currentPage?.paragraphs || [];
+  
   // Initialize AudioContext
   useEffect(() => {
     const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
@@ -112,10 +117,14 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     };
   }, []);
 
-  // Save progress whenever index changes
+  // Save progress whenever page or paragraph index changes
   useEffect(() => {
     const persistProgress = async () => {
-      const updatedDoc = { ...doc, progressIndex: currentParaIndex };
+      const updatedDoc = { 
+        ...doc, 
+        currentPage: currentPageIndex + 1, // Convert back to 1-indexed
+        currentParagraph: currentParaIndex 
+      };
       try {
         await saveDocument(updatedDoc);
         setDoc(updatedDoc);
@@ -126,7 +135,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
 
     void persistProgress();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentParaIndex]);
+  }, [currentPageIndex, currentParaIndex]);
 
   // Animation Loop for Progress Bar
   const updateProgress = useCallback(() => {
@@ -212,8 +221,9 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   };
 
   // Load Audio for current paragraph
-  const loadAudioForParagraph = useCallback(async (index: number, autoPlay: boolean, initialOffset: number = 0) => {
-    if (index >= doc.paragraphs.length) {
+  const loadAudioForParagraph = useCallback(async (pageIdx: number, paraIdx: number, autoPlay: boolean, initialOffset: number = 0) => {
+    const page = doc.pages[pageIdx];
+    if (!page || paraIdx >= page.paragraphs.length) {
         setIsPlaying(false);
         return;
     }
@@ -232,32 +242,34 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     try {
       let base64: string;
       
-      // Check if audio is already cached
-      if (doc.audioPaths && doc.audioPaths[index]) {
-        console.log(`[Player] Using cached audio for paragraph ${index}`);
+      // Check if audio is already cached for this paragraph in this page
+      if (page.audioPaths && page.audioPaths[paraIdx]) {
+        console.log(`[Player] Using cached audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
         // Fetch cached audio from Firebase Storage using SDK (no CORS issues)
-        const storageRef = ref(storage, doc.audioPaths[index]);
+        const storageRef = ref(storage, page.audioPaths[paraIdx]);
         const arrayBuffer = await getBytes(storageRef);
         base64 = encode(new Uint8Array(arrayBuffer));
       } else {
-        console.log(`[Player] Generating new audio for paragraph ${index}`);
-        const text = doc.paragraphs[index];
+        console.log(`[Player] Generating new audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
+        const text = page.paragraphs[paraIdx];
         base64 = await generateSpeech(text, settings.voiceGender);
         
         // Cache the audio in Firebase Storage
         const pcmBytes = decode(base64);
         const audioBlob = new Blob([pcmBytes], { type: 'application/octet-stream' });
-        const { storagePath, downloadURL } = await uploadAudioCache(doc.userId, doc.id, index, audioBlob);
+        const { storagePath, downloadURL } = await uploadAudioCache(doc.userId, doc.id, paraIdx, audioBlob);
         
-        // Update document with cached audio path and URL
-        const updatedAudioPaths = [...(doc.audioPaths || [])];
-        const updatedAudioUrls = [...(doc.audioUrls || [])];
-        updatedAudioPaths[index] = storagePath;
-        updatedAudioUrls[index] = downloadURL;
-        const updatedDoc = { ...doc, audioPaths: updatedAudioPaths, audioUrls: updatedAudioUrls };
+        // Update page with cached audio path and URL
+        const updatedPages = [...doc.pages];
+        const updatedAudioPaths = [...(page.audioPaths || [])];
+        const updatedAudioUrls = [...(page.audioUrls || [])];
+        updatedAudioPaths[paraIdx] = storagePath;
+        updatedAudioUrls[paraIdx] = downloadURL;
+        updatedPages[pageIdx] = { ...page, audioPaths: updatedAudioPaths, audioUrls: updatedAudioUrls };
+        const updatedDoc = { ...doc, pages: updatedPages };
         await saveDocument(updatedDoc);
         setDoc(updatedDoc);
-        console.log(`[Player] Cached audio for paragraph ${index}`);
+        console.log(`[Player] Cached audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
       }
       
       if (!audioCtxRef.current) return;
@@ -292,15 +304,15 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     // Only trigger load if we aren't manually seeking via the jumpToNote function
     // (jumpToNote calls loadAudioForParagraph directly)
     if (!audioBufferRef.current && !isLoadingAudio) {
-         loadAudioForParagraph(currentParaIndex, isPlaying);
+         loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying);
     }
-  }, [currentParaIndex]); 
+  }, [currentPageIndex, currentParaIndex]); 
   
   // Reload if voice gender changes
   useEffect(() => {
        // Reset buffer so it reloads
        audioBufferRef.current = null;
-       loadAudioForParagraph(currentParaIndex, isPlaying, playbackTime);
+       loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying, playbackTime);
   }, [settings.voiceGender]);
 
 
@@ -350,7 +362,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     if (audioBufferRef.current) {
       playBufferedAudio();
     } else {
-      loadAudioForParagraph(currentParaIndex, true);
+      loadAudioForParagraph(currentPageIndex, currentParaIndex, true);
     }
   };
 
@@ -381,14 +393,23 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
     currentBufferOffsetRef.current = 0; 
     setPlaybackTime(duration); // Show full bar
     
-    if (currentParaIndex < doc.paragraphs.length - 1) {
+    const currentPageParagraphs = doc.pages[currentPageIndex]?.paragraphs || [];
+    
+    // Check if there's a next paragraph in current page
+    if (currentParaIndex < currentPageParagraphs.length - 1) {
       setCurrentParaIndex(prev => prev + 1);
-      // Trigger load for next para
-      // Reset buffer so effect triggers load
       audioBufferRef.current = null;
-      // Small delay to allow React to update index state
-      setTimeout(() => loadAudioForParagraph(currentParaIndex + 1, true), 0);
-    } else {
+      setTimeout(() => loadAudioForParagraph(currentPageIndex, currentParaIndex + 1, true), 0);
+    } 
+    // Check if there's a next page
+    else if (currentPageIndex < doc.pages.length - 1) {
+      setCurrentPageIndex(prev => prev + 1);
+      setCurrentParaIndex(0);
+      audioBufferRef.current = null;
+      setTimeout(() => loadAudioForParagraph(currentPageIndex + 1, 0, true), 0);
+    } 
+    // End of document
+    else {
       setIsPlaying(false);
     }
   };
@@ -409,6 +430,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
 
     const newNote: Note = {
       id: uuidv4(),
+      pageNumber: currentPageIndex + 1, // 1-indexed
       paragraphIndex: currentParaIndex,
       timestamp: Math.max(0, timestamp),
       content: noteContent,
@@ -423,12 +445,15 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
   };
 
   const jumpToNote = (note: Note) => {
-      // If note is in a different paragraph
-      if (note.paragraphIndex !== currentParaIndex) {
+      const notePageIndex = note.pageNumber - 1; // Convert to 0-indexed
+      
+      // If note is in a different page or paragraph
+      if (notePageIndex !== currentPageIndex || note.paragraphIndex !== currentParaIndex) {
           // Force buffer clear to trigger reload
           audioBufferRef.current = null;
+          setCurrentPageIndex(notePageIndex);
           setCurrentParaIndex(note.paragraphIndex);
-          loadAudioForParagraph(note.paragraphIndex, true, note.timestamp);
+          loadAudioForParagraph(notePageIndex, note.paragraphIndex, true, note.timestamp);
       } else {
           // Same paragraph, just seek
           if (audioBufferRef.current) {
@@ -451,7 +476,9 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
       }
   }
   
-  const currentParaNotes = doc.notes.filter(n => n.paragraphIndex === currentParaIndex);
+  const currentParaNotes = doc.notes.filter(n => 
+    n.pageNumber === currentPageIndex + 1 && n.paragraphIndex === currentParaIndex
+  );
 
   return (
     <div className="flex flex-col h-screen bg-white">
@@ -480,12 +507,12 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
                   <div className="flex-1 text-sm">
                       <p className="font-bold">Playback Error</p>
                       <p>{audioError}</p>
-                      <button onClick={() => loadAudioForParagraph(currentParaIndex, true)} className="text-red-800 underline mt-1">Retry</button>
+                      <button onClick={() => loadAudioForParagraph(currentPageIndex, currentParaIndex, true)} className="text-red-800 underline mt-1">Retry</button>
                   </div>
               </div>
           )}
 
-          {doc.paragraphs.map((para, idx) => (
+          {currentParagraphs.map((para, idx) => (
             <p 
               key={idx} 
               onClick={() => {
@@ -518,7 +545,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
                           >
                               <div className="flex justify-between items-start mb-1">
                                   <span className="font-bold text-xs text-yellow-600 flex items-center gap-1">
-                                      Paragraph {note.paragraphIndex + 1}
+                                      Page {note.pageNumber}, Para {note.paragraphIndex + 1}
                                   </span>
                                   <span className="flex items-center text-xs font-mono bg-yellow-200/50 px-2 py-0.5 rounded text-yellow-700">
                                       <Clock className="w-3 h-3 mr-1" />
@@ -593,10 +620,16 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
                      onClick={() => {
                          if (currentParaIndex > 0) {
                             audioBufferRef.current = null;
-                            setCurrentParaIndex(Math.max(0, currentParaIndex - 1));
+                            setCurrentParaIndex(currentParaIndex - 1);
+                         } else if (currentPageIndex > 0) {
+                            // Go to last paragraph of previous page
+                            const prevPage = doc.pages[currentPageIndex - 1];
+                            audioBufferRef.current = null;
+                            setCurrentPageIndex(currentPageIndex - 1);
+                            setCurrentParaIndex(prevPage.paragraphs.length - 1);
                          }
                      }}
-                     disabled={currentParaIndex === 0}
+                     disabled={currentPageIndex === 0 && currentParaIndex === 0}
                      className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
                    >
                        <SkipBack className="w-8 h-8" />
@@ -618,12 +651,17 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
 
                    <button 
                      onClick={() => {
-                         if (currentParaIndex < doc.paragraphs.length - 1) {
+                         if (currentParaIndex < currentParagraphs.length - 1) {
                             audioBufferRef.current = null;
                             setCurrentParaIndex(currentParaIndex + 1);
+                         } else if (currentPageIndex < doc.pages.length - 1) {
+                            // Go to first paragraph of next page
+                            audioBufferRef.current = null;
+                            setCurrentPageIndex(currentPageIndex + 1);
+                            setCurrentParaIndex(0);
                          }
                      }}
-                     disabled={currentParaIndex === doc.paragraphs.length - 1}
+                     disabled={currentPageIndex === doc.pages.length - 1 && currentParaIndex === currentParagraphs.length - 1}
                      className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
                    >
                        <SkipForward className="w-8 h-8" />
@@ -635,7 +673,7 @@ export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, 
 
            {/* Global Progress Text */}
            <div className="text-center text-xs text-slate-300 font-medium">
-               Paragraph {currentParaIndex + 1} of {doc.paragraphs.length}
+               Page {currentPageIndex + 1} of {doc.pages.length} • Paragraph {currentParaIndex + 1} of {currentParagraphs.length}
            </div>
         </div>
       </div>
