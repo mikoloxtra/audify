@@ -92,9 +92,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onScanNew, onOpenDoc
                        <div className="flex items-center gap-3 text-xs text-slate-400">
                            <span className="flex items-center"><Clock className="w-3 h-3 mr-1"/> {new Date(doc.createdAt).toLocaleDateString()}</span>
                            <span>•</span>
-                           <span>{doc.pages.length} page{doc.pages.length !== 1 ? 's' : ''}</span>
+                           <span>{doc.content.totalParagraphs} paragraphs</span>
                            <span>•</span>
-                           <span>Page {doc.currentPage || 1}</span>
+                           <span>{Math.round((doc.playback.currentTime / doc.audio.duration) * 100)}% complete</span>
                        </div>
                    </div>
                  </div>

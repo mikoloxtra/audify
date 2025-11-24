@@ -1,67 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Document, AppSettings, Note, VoiceGender } from '../types';
-import { generateSpeech } from '../services/geminiService';
-import { saveDocument, uploadAudioCache } from '../services/storageService';
-import { storage } from '../services/firebase';
-import { ref, getBytes } from 'firebase/storage';
+import { Document, AppSettings, Note } from '../types';
+import { updatePlaybackProgress, saveNote, deleteNote } from '../services/storageService';
 import { Button } from './Button';
 import { 
   Play, Pause, SkipBack, SkipForward, Settings, 
-  Mic, X, Share2, MessageSquarePlus, Clock, AlertTriangle
+  X, MessageSquarePlus, Clock, Trash2, ChevronLeft
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
-
-// Use Web Speech API Recognition for "Pause" command
-const SpeechRecognition =
-  (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-// --- Audio Helpers for Gemini Raw PCM ---
-
-function decode(base64: string) {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function encode(bytes: Uint8Array): string {
-  // Convert Uint8Array to base64 in chunks to avoid stack overflow
-  const CHUNK_SIZE = 0x8000; // 32KB chunks
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-    const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
-
-async function decodeAudioData(
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number,
-): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
-}
-
-const formatTime = (seconds: number) => {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-};
+import { formatTime } from '../services/textUtils';
 
 interface PlayerProps {
   document: Document;
@@ -70,693 +16,538 @@ interface PlayerProps {
   onBack: () => void;
 }
 
-export const Player: React.FC<PlayerProps> = ({ document: initialDoc, settings, onUpdateSettings, onBack }) => {
+export const Player: React.FC<PlayerProps> = ({ 
+  document: initialDoc, 
+  settings, 
+  onUpdateSettings, 
+  onBack 
+}) => {
   const [doc, setDoc] = useState(initialDoc);
-  const [currentPageIndex, setCurrentPageIndex] = useState((doc.currentPage || 1) - 1); // Convert to 0-indexed
-  const [currentParaIndex, setCurrentParaIndex] = useState(doc.currentParagraph || 0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
-  const [audioError, setAudioError] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(doc.playback.currentTime || 0);
+  const [duration, setDuration] = useState(doc.audio.duration);
+  const [currentParagraphIndex, setCurrentParagraphIndex] = useState(
+    doc.playback.currentParagraphIndex || 0
+  );
+  
+  // UI State
   const [showSettings, setShowSettings] = useState(false);
   const [showNoteModal, setShowNoteModal] = useState(false);
   const [noteContent, setNoteContent] = useState('');
-  const [voiceListening, setVoiceListening] = useState(false);
-  
-  // Time Tracking State
-  const [playbackTime, setPlaybackTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  
-  const recognitionRef = useRef<any>(null);
-  
-  // Web Audio API Refs
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioBufferRef = useRef<AudioBuffer | null>(null);
-  const isManualStopRef = useRef<boolean>(false);
-  
-  // Time Tracking Refs
-  const startTimeRef = useRef<number>(0); // AudioContext time when playback started
-  const currentBufferOffsetRef = useRef<number>(0); // Offset in seconds within current buffer
-  const rafRef = useRef<number | null>(null); // Request Animation Frame
+  const [isLoadingAudio, setIsLoadingAudio] = useState(true);
+  const [audioError, setAudioError] = useState<string | null>(null);
 
-  // Helper to get current page
-  const currentPage = doc.pages[currentPageIndex];
-  const currentParagraphs = currentPage?.paragraphs || [];
-  
-  // Initialize AudioContext
+  // Refs
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const paragraphRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const progressSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Get current paragraph based on time
+  const getCurrentParagraph = useCallback((time: number) => {
+    return doc.content.paragraphs.find(
+      p => time >= p.startTime && time < p.endTime
+    );
+  }, [doc.content.paragraphs]);
+
+  // Initialize audio element
   useEffect(() => {
-    const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
-    // Gemini TTS uses 24000Hz
-    audioCtxRef.current = new AudioContextClass({ sampleRate: 24000 });
+    console.log('[Player] Initializing audio with URL:', doc.audio.downloadURL);
+    
+    if (!doc.audio.downloadURL) {
+      setAudioError('Audio file not found. The document may not have been processed correctly.');
+      setIsLoadingAudio(false);
+      return;
+    }
+
+    const audio = new Audio();
+    audio.src = doc.audio.downloadURL;
+    audio.preload = 'auto';
+    audio.crossOrigin = 'anonymous'; // Enable CORS
+    
+    audio.addEventListener('loadedmetadata', () => {
+      setDuration(audio.duration);
+      setIsLoadingAudio(false);
+      console.log('[Player] Audio loaded, duration:', audio.duration);
+    });
+
+    audio.addEventListener('error', (e) => {
+      console.error('[Player] Audio error:', e);
+      console.error('[Player] Audio URL:', audio.src);
+      console.error('[Player] Audio error code:', audio.error?.code);
+      console.error('[Player] Audio error message:', audio.error?.message);
+      
+      let errorMsg = 'Failed to load audio. ';
+      if (audio.error?.code === 4) {
+        errorMsg += 'Audio format not supported or file is corrupted.';
+      } else if (audio.error?.code === 2) {
+        errorMsg += 'Network error. Check your internet connection.';
+      } else if (audio.error?.code === 3) {
+        errorMsg += 'Audio decoding failed.';
+      } else {
+        errorMsg += 'Please check Firebase Storage CORS settings.';
+      }
+      
+      setAudioError(errorMsg);
+      setIsLoadingAudio(false);
+    });
+
+    audio.addEventListener('timeupdate', () => {
+      setCurrentTime(audio.currentTime);
+      
+      // Update active paragraph
+      const activePara = getCurrentParagraph(audio.currentTime);
+      if (activePara && activePara.index !== currentParagraphIndex) {
+        setCurrentParagraphIndex(activePara.index);
+      }
+    });
+
+    audio.addEventListener('ended', () => {
+      setIsPlaying(false);
+      setCurrentTime(duration);
+    });
+
+    audio.playbackRate = settings.playbackSpeed;
+    audioRef.current = audio;
+
+    // Set initial time
+    if (doc.playback.currentTime > 0) {
+      audio.currentTime = doc.playback.currentTime;
+    }
 
     return () => {
-      if (audioCtxRef.current) {
-        audioCtxRef.current.close();
-      }
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      audio.pause();
+      audio.src = '';
+      audioRef.current = null;
     };
-  }, []);
+  }, [doc.audio.downloadURL, doc.playback.currentTime]);
 
-  // Save progress whenever page or paragraph index changes
+  // Update playback speed
   useEffect(() => {
-    const persistProgress = async () => {
-      const updatedDoc = { 
-        ...doc, 
-        currentPage: currentPageIndex + 1, // Convert back to 1-indexed
-        currentParagraph: currentParaIndex 
-      };
-      try {
-        await saveDocument(updatedDoc);
-        setDoc(updatedDoc);
-      } catch (error) {
-        console.error('Failed to save listening progress:', error);
-      }
-    };
-
-    void persistProgress();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPageIndex, currentParaIndex]);
-
-  // Animation Loop for Progress Bar
-  const updateProgress = useCallback(() => {
-    if (audioCtxRef.current && isPlaying && duration > 0) {
-       const elapsed = audioCtxRef.current.currentTime - startTimeRef.current;
-       // Calculate current position in buffer: startOffset + (elapsed * speed)
-       const currentPos = currentBufferOffsetRef.current + (elapsed * settings.playbackSpeed);
-       setPlaybackTime(Math.min(currentPos, duration));
-       
-       rafRef.current = requestAnimationFrame(updateProgress);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = settings.playbackSpeed;
     }
-  }, [isPlaying, settings.playbackSpeed, duration]);
+  }, [settings.playbackSpeed]);
 
+  // Auto-scroll to active paragraph
   useEffect(() => {
+    const paragraphElement = paragraphRefs.current[currentParagraphIndex];
+    if (paragraphElement) {
+      paragraphElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+    }
+  }, [currentParagraphIndex]);
+
+  // Save progress periodically
+  useEffect(() => {
+    if (progressSaveTimerRef.current) {
+      clearTimeout(progressSaveTimerRef.current);
+    }
+
+    progressSaveTimerRef.current = setTimeout(() => {
+      if (currentTime > 0) {
+        updatePlaybackProgress(doc.id, currentTime, currentParagraphIndex).catch(err => {
+          console.error('[Player] Failed to save progress:', err);
+        });
+      }
+    }, 2000); // Save every 2 seconds
+
+    return () => {
+      if (progressSaveTimerRef.current) {
+        clearTimeout(progressSaveTimerRef.current);
+      }
+    };
+  }, [currentTime, currentParagraphIndex, doc.id]);
+
+  // Playback controls
+  const handlePlayPause = () => {
+    if (!audioRef.current) return;
+
     if (isPlaying) {
-      rafRef.current = requestAnimationFrame(updateProgress);
+      audioRef.current.pause();
+      setIsPlaying(false);
     } else {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    }
-    return () => {
-        if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
-  }, [isPlaying, updateProgress]);
-
-
-  // Helper to play current buffer
-  const playBufferedAudio = (startOffset: number = currentBufferOffsetRef.current) => {
-    if (!audioCtxRef.current || !audioBufferRef.current) return;
-    
-    // Resume context if suspended (browser policy)
-    if (audioCtxRef.current.state === 'suspended') {
-        audioCtxRef.current.resume();
-    }
-
-    // Stop previous if running
-    if (sourceRef.current) {
-        try { sourceRef.current.stop(); } catch(e) {}
-    }
-
-    isManualStopRef.current = false;
-    const source = audioCtxRef.current.createBufferSource();
-    source.buffer = audioBufferRef.current;
-    source.playbackRate.value = settings.playbackSpeed;
-    source.connect(audioCtxRef.current.destination);
-    
-    source.onended = () => {
-        if (!isManualStopRef.current) {
-            handleAudioEnded();
-        }
-    };
-
-    // Handle boundary check
-    if (startOffset >= audioBufferRef.current.duration) {
-        startOffset = 0;
-    }
-
-    currentBufferOffsetRef.current = startOffset;
-    startTimeRef.current = audioCtxRef.current.currentTime;
-    
-    source.start(0, startOffset);
-    sourceRef.current = source;
-    setIsPlaying(true);
-    
-    // Ensure voice command listening matches state
-    if (voiceListening && recognitionRef.current) {
-       try { recognitionRef.current.start(); } catch(e) {}
+      audioRef.current.play().catch(err => {
+        console.error('[Player] Play error:', err);
+        setAudioError('Failed to play audio. Please try again.');
+      });
+      setIsPlaying(true);
     }
   };
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!duration) return;
-      
-      const rect = e.currentTarget.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const percent = Math.min(1, Math.max(0, x / rect.width));
-      const newTime = percent * duration;
+    if (!audioRef.current) return;
 
-      currentBufferOffsetRef.current = newTime;
-      setPlaybackTime(newTime);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const percent = Math.min(1, Math.max(0, x / rect.width));
+    const newTime = percent * duration;
 
-      if (isPlaying && audioBufferRef.current) {
-          playBufferedAudio(newTime);
-      }
+    audioRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
   };
 
-  // Load Audio for current paragraph
-  const loadAudioForParagraph = useCallback(async (pageIdx: number, paraIdx: number, autoPlay: boolean, initialOffset: number = 0) => {
-    const page = doc.pages[pageIdx];
-    if (!page || paraIdx >= page.paragraphs.length) {
-        setIsPlaying(false);
-        return;
+  const seekToParagraph = (paragraphIndex: number) => {
+    if (!audioRef.current) return;
+
+    const paragraph = doc.content.paragraphs[paragraphIndex];
+    if (paragraph) {
+      audioRef.current.currentTime = paragraph.startTime;
+      setCurrentTime(paragraph.startTime);
+      setCurrentParagraphIndex(paragraphIndex);
     }
-    
-    setIsLoadingAudio(true);
-    setAudioError(null);
-    setPlaybackTime(0);
-    setDuration(0);
-    
-    // Stop current playback while loading next
-    if (sourceRef.current) {
-        isManualStopRef.current = true;
-        try { sourceRef.current.stop(); } catch(e) {}
-    }
+  };
 
-    try {
-      let base64: string;
-      
-      // Check if audio is already cached for this paragraph in this page
-      if (page.audioPaths && page.audioPaths[paraIdx]) {
-        console.log(`[Player] Using cached audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
-        // Fetch cached audio from Firebase Storage using SDK (no CORS issues)
-        const storageRef = ref(storage, page.audioPaths[paraIdx]);
-        const arrayBuffer = await getBytes(storageRef);
-        base64 = encode(new Uint8Array(arrayBuffer));
-      } else {
-        console.log(`[Player] Generating new audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
-        const text = page.paragraphs[paraIdx];
-        base64 = await generateSpeech(text, settings.voiceGender);
-        
-        // Cache the audio in Firebase Storage
-        const pcmBytes = decode(base64);
-        const audioBlob = new Blob([pcmBytes], { type: 'application/octet-stream' });
-        const { storagePath, downloadURL } = await uploadAudioCache(doc.userId, doc.id, paraIdx, audioBlob);
-        
-        // Update page with cached audio path and URL
-        const updatedPages = [...doc.pages];
-        const updatedAudioPaths = [...(page.audioPaths || [])];
-        const updatedAudioUrls = [...(page.audioUrls || [])];
-        updatedAudioPaths[paraIdx] = storagePath;
-        updatedAudioUrls[paraIdx] = downloadURL;
-        updatedPages[pageIdx] = { ...page, audioPaths: updatedAudioPaths, audioUrls: updatedAudioUrls };
-        const updatedDoc = { ...doc, pages: updatedPages };
-        await saveDocument(updatedDoc);
-        setDoc(updatedDoc);
-        console.log(`[Player] Cached audio for page ${pageIdx + 1}, paragraph ${paraIdx}`);
-      }
-      
-      if (!audioCtxRef.current) return;
-
-      // Decode Raw PCM
-      const pcmBytes = decode(base64);
-      const audioBuffer = await decodeAudioData(pcmBytes, audioCtxRef.current, 24000, 1);
-      
-      audioBufferRef.current = audioBuffer;
-      setDuration(audioBuffer.duration);
-      
-      currentBufferOffsetRef.current = initialOffset;
-      setPlaybackTime(initialOffset);
-      
-      if (autoPlay) {
-        playBufferedAudio(initialOffset);
-      } else {
-        setIsPlaying(false);
-      }
-
-    } catch (error: any) {
-      console.error("Failed to load audio", error);
-      setIsPlaying(false);
-      setAudioError(error.message || "Failed to generate audio for this section.");
-    } finally {
-      setIsLoadingAudio(false);
-    }
-  }, [doc, settings.voiceGender]);
-
-  // Initial load and page/paragraph change handling
-  useEffect(() => {
-    if (!audioBufferRef.current && !isLoadingAudio) {
-      loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPageIndex, currentParaIndex]);
-  
-  // Reload if voice gender changes
-  useEffect(() => {
-    audioBufferRef.current = null;
-    loadAudioForParagraph(currentPageIndex, currentParaIndex, isPlaying, playbackTime);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.voiceGender]);
-
-  // Playback Speed Control
-  useEffect(() => {
-    if (sourceRef.current) {
-      sourceRef.current.playbackRate.value = settings.playbackSpeed;
-    }
-  }, [settings.playbackSpeed]);
-
-  // Voice Command Recognition Setup
-  useEffect(() => {
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = false;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        const last = event.results.length - 1;
-        const command = event.results[last][0].transcript.trim().toLowerCase();
-        
-        if (command.includes('pause') || command.includes('stop')) {
-          handlePause();
-          setShowNoteModal(true);
-          setVoiceListening(false);
-          recognition.stop();
-        }
-      };
-      
-      recognitionRef.current = recognition;
-    }
-  }, []);
-
-  const toggleVoiceControl = () => {
-    if (!recognitionRef.current) return;
-    if (voiceListening) {
-      recognitionRef.current.stop();
-      setVoiceListening(false);
+  const handleSkipBack = () => {
+    if (currentParagraphIndex > 0) {
+      seekToParagraph(currentParagraphIndex - 1);
     } else {
-      try { recognitionRef.current.start(); } catch(e) {}
-      setVoiceListening(true);
-    }
-  };
-
-  const handlePlay = () => {
-    if (audioBufferRef.current) {
-      playBufferedAudio();
-    } else {
-      loadAudioForParagraph(currentPageIndex, currentParaIndex, true);
-    }
-  };
-
-  const handlePause = () => {
-    if (sourceRef.current && audioCtxRef.current) {
-      // Calculate elapsed time since start of this segment
-      const elapsed = audioCtxRef.current.currentTime - startTimeRef.current;
-      // Precise tracking including speed
-      currentBufferOffsetRef.current += elapsed * settings.playbackSpeed;
-      
-      // Clamp to duration
-      if (audioBufferRef.current) {
-          currentBufferOffsetRef.current = Math.min(currentBufferOffsetRef.current, audioBufferRef.current.duration);
+      // Go to start
+      if (audioRef.current) {
+        audioRef.current.currentTime = 0;
+        setCurrentTime(0);
       }
-
-      isManualStopRef.current = true;
-      sourceRef.current.stop();
-      setIsPlaying(false);
-      
-      // Update UI state immediately
-      setPlaybackTime(currentBufferOffsetRef.current);
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
     }
   };
 
-  const handleAudioEnded = () => {
-    // If we hit the end of the current paragraph buffer naturally
-    currentBufferOffsetRef.current = 0;
-    setPlaybackTime(duration);
-    
-    const currentPageParagraphs = doc.pages[currentPageIndex]?.paragraphs || [];
-    
-    // Check if there's a next paragraph in current page
-    if (currentParaIndex < currentPageParagraphs.length - 1) {
-      setCurrentParaIndex(prev => prev + 1);
-      audioBufferRef.current = null;
-      setTimeout(() => loadAudioForParagraph(currentPageIndex, currentParaIndex + 1, true), 0);
-    } 
-    // Check if there's a next page
-    else if (currentPageIndex < doc.pages.length - 1) {
-      setCurrentPageIndex(prev => prev + 1);
-      setCurrentParaIndex(0);
-      audioBufferRef.current = null;
-      setTimeout(() => loadAudioForParagraph(currentPageIndex + 1, 0, true), 0);
-    } 
-    // End of document
-    else {
-      setIsPlaying(false);
+  const handleSkipForward = () => {
+    if (currentParagraphIndex < doc.content.paragraphs.length - 1) {
+      seekToParagraph(currentParagraphIndex + 1);
     }
   };
 
-  const saveNote = () => {
+  // Notes
+  const handleAddNote = async () => {
     if (!noteContent.trim()) {
-        setShowNoteModal(false);
-        return;
-    }
-
-    // Calculate current timestamp
-    let timestamp = currentBufferOffsetRef.current;
-    // If playing, we need to add the elapsed time since last "start"
-    if (isPlaying && audioCtxRef.current) {
-         const elapsed = audioCtxRef.current.currentTime - startTimeRef.current;
-         timestamp += elapsed * settings.playbackSpeed;
+      setShowNoteModal(false);
+      return;
     }
 
     const newNote: Note = {
       id: uuidv4(),
-      pageNumber: currentPageIndex + 1, // 1-indexed
-      paragraphIndex: currentParaIndex,
-      timestamp: Math.max(0, timestamp),
-      content: noteContent,
+      timestamp: currentTime,
+      paragraphIndex: currentParagraphIndex,
+      content: noteContent.trim(),
       createdAt: new Date().toISOString(),
     };
-    const updatedDoc = { ...doc, notes: [...doc.notes, newNote] };
-    void saveDocument(updatedDoc)
-      .then(() => setDoc(updatedDoc))
-      .catch((error) => console.error('Failed to save note:', error));
-    setNoteContent('');
-    setShowNoteModal(false);
+
+    try {
+      await saveNote(doc.id, newNote);
+      setDoc({
+        ...doc,
+        notes: [...doc.notes, newNote],
+      });
+      setNoteContent('');
+      setShowNoteModal(false);
+    } catch (error) {
+      console.error('[Player] Failed to save note:', error);
+      alert('Failed to save note. Please try again.');
+    }
+  };
+
+  const handleDeleteNote = async (noteId: string) => {
+    try {
+      await deleteNote(doc.id, noteId);
+      setDoc({
+        ...doc,
+        notes: doc.notes.filter(n => n.id !== noteId),
+      });
+    } catch (error) {
+      console.error('[Player] Failed to delete note:', error);
+      alert('Failed to delete note. Please try again.');
+    }
   };
 
   const jumpToNote = (note: Note) => {
-      const notePageIndex = note.pageNumber - 1; // Convert to 0-indexed
-      
-      // If note is in a different page or paragraph
-      if (notePageIndex !== currentPageIndex || note.paragraphIndex !== currentParaIndex) {
-          // Force buffer clear to trigger reload
-          audioBufferRef.current = null;
-          setCurrentPageIndex(notePageIndex);
-          setCurrentParaIndex(note.paragraphIndex);
-          loadAudioForParagraph(notePageIndex, note.paragraphIndex, true, note.timestamp);
-      } else {
-          // Same paragraph, just seek
-          if (audioBufferRef.current) {
-              currentBufferOffsetRef.current = note.timestamp;
-              setPlaybackTime(note.timestamp);
-              playBufferedAudio(note.timestamp);
-          }
-      }
+    if (!audioRef.current) return;
+
+    audioRef.current.currentTime = note.timestamp;
+    setCurrentTime(note.timestamp);
+    setCurrentParagraphIndex(note.paragraphIndex);
   };
 
-  const handleShare = () => {
-      if (navigator.share) {
-          navigator.share({
-              title: `Listening to ${doc.title}`,
-              text: `I'm listening to ${doc.title} on Audify!`,
-              url: window.location.href
-          }).catch(console.error);
-      } else {
-          alert("Sharing not supported on this browser, but you can copy the URL!");
-      }
-  }
-  
-  const currentParaNotes = doc.notes.filter(n => 
-    n.pageNumber === currentPageIndex + 1 && n.paragraphIndex === currentParaIndex
+  const currentParaNotes = doc.notes.filter(
+    n => n.paragraphIndex === currentParagraphIndex
   );
 
   return (
     <div className="flex flex-col h-screen bg-white">
       {/* Header */}
-      <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-white z-10">
-        <button onClick={onBack} className="p-2 -ml-2 text-slate-500 hover:bg-slate-50 rounded-full">
-            <SkipBack className="w-6 h-6" />
-        </button>
-        <h2 className="text-lg font-semibold truncate max-w-[200px]">{doc.title}</h2>
-        <div className="flex gap-2">
-             <button onClick={handleShare} className="p-2 text-slate-500 hover:bg-slate-50 rounded-full">
-                <Share2 className="w-5 h-5" />
-            </button>
-            <button onClick={() => setShowSettings(!showSettings)} className="p-2 text-slate-500 hover:bg-slate-50 rounded-full">
-                <Settings className="w-6 h-6" />
-            </button>
-        </div>
-      </div>
-
-      {/* Main Content - Text Display */}
-      <div className="flex-1 overflow-y-auto p-6 bg-slate-50">
-        <div className="max-w-2xl mx-auto space-y-4">
-          {audioError && (
-              <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 flex items-center gap-3">
-                  <AlertTriangle className="w-5 h-5 flex-shrink-0" />
-                  <div className="flex-1 text-sm">
-                      <p className="font-bold">Playback Error</p>
-                      <p>{audioError}</p>
-                      <button onClick={() => loadAudioForParagraph(currentPageIndex, currentParaIndex, true)} className="text-red-800 underline mt-1">Retry</button>
-                  </div>
-              </div>
-          )}
-
-          {currentParagraphs.map((para, idx) => (
-            <p 
-              key={idx} 
-              onClick={() => {
-                  if (idx !== currentParaIndex) {
-                      audioBufferRef.current = null;
-                      setCurrentParaIndex(idx);
-                      // Effect will trigger load
-                  }
-              }}
-              className={`p-4 rounded-xl text-lg leading-relaxed transition-all cursor-pointer ${
-                idx === currentParaIndex 
-                  ? 'bg-white shadow-md border-l-4 border-indigo-500 text-slate-900' 
-                  : 'text-slate-500 hover:bg-white hover:shadow-sm'
-              }`}
-            >
-              {para}
+      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={onBack}
+            className="text-slate-600 hover:text-slate-900"
+          >
+            <ChevronLeft className="w-6 h-6" />
+          </button>
+          <div>
+            <h1 className="text-xl font-bold text-slate-900">{doc.title}</h1>
+            <p className="text-sm text-slate-500">
+              {doc.content.totalParagraphs} paragraphs • {formatTime(duration)}
             </p>
-          ))}
-          
-          {/* Notes Section Inline */}
-           {doc.notes.length > 0 && (
-              <div className="mt-8 border-t border-slate-200 pt-8">
-                  <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-4">Your Notes</h3>
-                  <div className="grid gap-3">
-                      {doc.notes.map(note => (
-                          <div 
-                            key={note.id} 
-                            onClick={() => jumpToNote(note)}
-                            className="group bg-yellow-50 p-4 rounded-lg border border-yellow-100 text-yellow-900 text-sm cursor-pointer hover:bg-yellow-100 hover:shadow-sm transition-all"
-                          >
-                              <div className="flex justify-between items-start mb-1">
-                                  <span className="font-bold text-xs text-yellow-600 flex items-center gap-1">
-                                      Page {note.pageNumber}, Para {note.paragraphIndex + 1}
-                                  </span>
-                                  <span className="flex items-center text-xs font-mono bg-yellow-200/50 px-2 py-0.5 rounded text-yellow-700">
-                                      <Clock className="w-3 h-3 mr-1" />
-                                      {formatTime(note.timestamp)}
-                                  </span>
-                              </div>
-                              <p>{note.content}</p>
-                          </div>
-                      ))}
-                  </div>
-              </div>
-           )}
+          </div>
         </div>
-      </div>
+        <button
+          onClick={() => setShowSettings(!showSettings)}
+          className="text-slate-600 hover:text-slate-900"
+        >
+          <Settings className="w-6 h-6" />
+        </button>
+      </header>
 
-      {/* Floating Action for Notes */}
-      <button 
-        onClick={() => { handlePause(); setShowNoteModal(true); }}
-        className="absolute bottom-36 right-6 w-14 h-14 bg-indigo-600 text-white rounded-full shadow-lg shadow-indigo-300 flex items-center justify-center hover:bg-indigo-700 active:scale-95 transition-transform"
-      >
-        <MessageSquarePlus className="w-6 h-6" />
-      </button>
+      {/* Main Content */}
+      <div className="flex-1 overflow-y-auto px-6 py-8">
+        {isLoadingAudio && (
+          <div className="text-center py-20 text-slate-500">
+            Loading audio...
+          </div>
+        )}
+
+        {audioError && (
+          <div className="mb-6 p-4 bg-red-50 text-red-700 rounded-xl flex items-center gap-3">
+            <div className="flex-1 text-sm">
+              <p className="font-bold">Playback Error</p>
+              <p>{audioError}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Paragraphs */}
+        {!isLoadingAudio && (
+          <div className="max-w-3xl mx-auto space-y-4">
+            {doc.content.paragraphs.map((para, idx) => (
+              <div
+                key={para.id}
+                ref={el => paragraphRefs.current[idx] = el}
+                onClick={() => seekToParagraph(idx)}
+                className={`p-4 rounded-xl text-lg leading-relaxed transition-all cursor-pointer ${
+                  idx === currentParagraphIndex
+                    ? 'bg-indigo-50 border-l-4 border-indigo-500 text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                <p>{para.text}</p>
+                
+                {/* Notes for this paragraph */}
+                {currentParaNotes.length > 0 && idx === currentParagraphIndex && (
+                  <div className="mt-4 space-y-2">
+                    {currentParaNotes.map(note => (
+                      <div
+                        key={note.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          jumpToNote(note);
+                        }}
+                        className="bg-yellow-50 p-3 rounded-lg border border-yellow-100 text-sm cursor-pointer hover:bg-yellow-100"
+                      >
+                        <div className="flex justify-between items-start mb-1">
+                          <span className="font-bold text-xs text-yellow-600 flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {formatTime(note.timestamp)}
+                          </span>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteNote(note.id);
+                            }}
+                            className="text-yellow-600 hover:text-red-600"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                        <p className="text-yellow-900">{note.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* All Notes Section */}
+            {doc.notes.length > 0 && (
+              <div className="mt-8 border-t border-slate-200 pt-8">
+                <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-4">
+                  All Notes ({doc.notes.length})
+                </h3>
+                <div className="grid gap-3">
+                  {doc.notes.map(note => (
+                    <div
+                      key={note.id}
+                      onClick={() => jumpToNote(note)}
+                      className="bg-yellow-50 p-4 rounded-lg border border-yellow-100 cursor-pointer hover:bg-yellow-100"
+                    >
+                      <div className="flex justify-between items-start mb-1">
+                        <span className="font-bold text-xs text-yellow-600">
+                          Para {note.paragraphIndex + 1} • {formatTime(note.timestamp)}
+                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteNote(note.id);
+                          }}
+                          className="text-yellow-600 hover:text-red-600"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                      <p className="text-sm text-yellow-900">{note.content}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Player Controls */}
-      <div className="bg-white border-t border-slate-200 p-6 pb-8 shadow-[0_-4px_20px_rgba(0,0,0,0.05)]">
-        <div className="max-w-2xl mx-auto">
-           {/* Audio Scrubber (Time) */}
-           <div className="mb-6 relative group">
-               <div 
-                 className="h-2 bg-slate-200 rounded-full cursor-pointer relative overflow-visible"
-                 onClick={handleSeek}
-               >
-                  {/* Fill */}
-                  <div className="h-full bg-indigo-500 rounded-full relative pointer-events-none" style={{width: `${duration ? (playbackTime/duration)*100 : 0}%`}}>
-                      <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white border-2 border-indigo-500 rounded-full shadow opacity-0 group-hover:opacity-100 transition-opacity" />
-                  </div>
-                  
-                  {/* Note Markers */}
-                  {currentParaNotes.map(note => (
-                      <div 
-                         key={note.id}
-                         className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 bg-yellow-400 rounded-full border border-white shadow-sm z-20 transition-transform hover:scale-150 cursor-pointer"
-                         style={{ left: `${duration ? (note.timestamp / duration) * 100 : 0}%` }}
-                         title={`Note: ${note.content}`}
-                         onClick={(e) => { e.stopPropagation(); jumpToNote(note); }}
-                      />
-                  ))}
-               </div>
-               
-               {/* Time Labels */}
-               <div className="flex justify-between text-xs text-slate-400 mt-2 font-medium font-mono">
-                   <span>{formatTime(playbackTime)}</span>
-                   <span>{formatTime(duration)}</span>
-               </div>
-           </div>
+      <div className="bg-white border-t border-slate-200 px-6 py-4">
+        <div className="max-w-3xl mx-auto space-y-4">
+          {/* Timeline */}
+          <div
+            className="relative h-2 bg-slate-200 rounded-full cursor-pointer group"
+            onClick={handleSeek}
+          >
+            <div
+              className="absolute h-2 bg-indigo-600 rounded-full"
+              style={{ width: `${(currentTime / duration) * 100}%` }}
+            />
+            <div
+              className="absolute w-4 h-4 bg-indigo-600 rounded-full -mt-1 shadow-lg opacity-0 group-hover:opacity-100 transition-opacity"
+              style={{ left: `${(currentTime / duration) * 100}%`, marginLeft: '-8px' }}
+            />
+          </div>
 
-           {/* Controls */}
-           <div className="flex items-center justify-between mb-4">
-               <div className="flex items-center gap-4">
-                   <button 
-                      onClick={toggleVoiceControl}
-                      className={`p-3 rounded-full transition-colors ${voiceListening ? 'bg-red-100 text-red-600 animate-pulse' : 'bg-slate-100 text-slate-500'}`}
-                      title="Voice Control: Say 'Pause' to add a note"
-                   >
-                       <Mic className="w-5 h-5" />
-                   </button>
-                   {voiceListening && <span className="text-xs text-red-500 font-medium">Listening...</span>}
-               </div>
+          {/* Time Display */}
+          <div className="flex justify-between text-xs text-slate-500">
+            <span>{formatTime(currentTime)}</span>
+            <span>{formatTime(duration)}</span>
+          </div>
 
-               <div className="flex items-center gap-6">
-                   <button 
-                     onClick={() => {
-                         if (currentParaIndex > 0) {
-                            audioBufferRef.current = null;
-                            setCurrentParaIndex(currentParaIndex - 1);
-                         } else if (currentPageIndex > 0) {
-                            // Go to last paragraph of previous page
-                            const prevPage = doc.pages[currentPageIndex - 1];
-                            audioBufferRef.current = null;
-                            setCurrentPageIndex(currentPageIndex - 1);
-                            setCurrentParaIndex(prevPage.paragraphs.length - 1);
-                         }
-                     }}
-                     disabled={currentPageIndex === 0 && currentParaIndex === 0}
-                     className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
-                   >
-                       <SkipBack className="w-8 h-8" />
-                   </button>
-                   
-                   <button 
-                     onClick={isPlaying ? handlePause : handlePlay}
-                     disabled={isLoadingAudio}
-                     className="w-16 h-16 bg-indigo-600 text-white rounded-full flex items-center justify-center shadow-xl shadow-indigo-200 hover:bg-indigo-700 active:scale-95 transition-all disabled:opacity-70"
-                   >
-                       {isLoadingAudio ? (
-                           <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                       ) : isPlaying ? (
-                           <Pause className="w-8 h-8 fill-current" />
-                       ) : (
-                           <Play className="w-8 h-8 fill-current ml-1" />
-                       )}
-                   </button>
+          {/* Controls */}
+          <div className="flex items-center justify-center gap-6">
+            <button
+              onClick={handleSkipBack}
+              disabled={currentParagraphIndex === 0}
+              className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
+            >
+              <SkipBack className="w-8 h-8" />
+            </button>
 
-                   <button 
-                     onClick={() => {
-                         if (currentParaIndex < currentParagraphs.length - 1) {
-                            audioBufferRef.current = null;
-                            setCurrentParaIndex(currentParaIndex + 1);
-                         } else if (currentPageIndex < doc.pages.length - 1) {
-                            // Go to first paragraph of next page
-                            audioBufferRef.current = null;
-                            setCurrentPageIndex(currentPageIndex + 1);
-                            setCurrentParaIndex(0);
-                         }
-                     }}
-                     disabled={currentPageIndex === doc.pages.length - 1 && currentParaIndex === currentParagraphs.length - 1}
-                     className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
-                   >
-                       <SkipForward className="w-8 h-8" />
-                   </button>
-               </div>
+            <button
+              onClick={handlePlayPause}
+              disabled={isLoadingAudio}
+              className="w-14 h-14 bg-indigo-600 text-white rounded-full flex items-center justify-center hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 ml-1" />}
+            </button>
 
-               <div className="w-12" /> {/* Spacer for balance */}
-           </div>
+            <button
+              onClick={handleSkipForward}
+              disabled={currentParagraphIndex === doc.content.paragraphs.length - 1}
+              className="text-slate-400 hover:text-indigo-600 disabled:opacity-30"
+            >
+              <SkipForward className="w-8 h-8" />
+            </button>
+          </div>
 
-           {/* Global Progress Text */}
-           <div className="text-center text-xs text-slate-300 font-medium">
-               Page {currentPageIndex + 1} of {doc.pages.length} • Paragraph {currentParaIndex + 1} of {currentParagraphs.length}
-           </div>
+          {/* Progress Text */}
+          <div className="text-center text-xs text-slate-400 font-medium">
+            Paragraph {currentParagraphIndex + 1} of {doc.content.totalParagraphs}
+          </div>
+
+          {/* Add Note Button */}
+          <div className="flex justify-center">
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setShowNoteModal(true)}
+            >
+              <MessageSquarePlus className="w-4 h-4 mr-2" />
+              Add Note
+            </Button>
+          </div>
         </div>
       </div>
 
-      {/* Settings Modal Overlay */}
+      {/* Settings Modal */}
       {showSettings && (
-        <div className="absolute inset-0 bg-black/20 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center" onClick={() => setShowSettings(false)}>
-            <div className="bg-white w-full max-w-sm mx-auto p-6 rounded-t-2xl sm:rounded-2xl shadow-2xl" onClick={e => e.stopPropagation()}>
-                <div className="flex justify-between items-center mb-6">
-                    <h3 className="font-bold text-lg">Audio Settings</h3>
-                    <button onClick={() => setShowSettings(false)}><X className="w-5 h-5 text-slate-400"/></button>
-                </div>
-                
-                <div className="space-y-6">
-                    <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-3">Voice</label>
-                        <div className="grid grid-cols-2 gap-3">
-                            <button 
-                                onClick={() => onUpdateSettings({...settings, voiceGender: VoiceGender.MALE})}
-                                className={`py-3 rounded-xl border font-medium transition-all ${settings.voiceGender === VoiceGender.MALE ? 'border-indigo-600 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'}`}
-                            >
-                                Male (Fenrir)
-                            </button>
-                            <button 
-                                onClick={() => onUpdateSettings({...settings, voiceGender: VoiceGender.FEMALE})}
-                                className={`py-3 rounded-xl border font-medium transition-all ${settings.voiceGender === VoiceGender.FEMALE ? 'border-indigo-600 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'}`}
-                            >
-                                Female (Kore)
-                            </button>
-                        </div>
-                    </div>
-
-                    <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-3">Speed ({settings.playbackSpeed}x)</label>
-                        <input 
-                            type="range" 
-                            min="0.5" 
-                            max="2.0" 
-                            step="0.25"
-                            value={settings.playbackSpeed}
-                            onChange={(e) => onUpdateSettings({...settings, playbackSpeed: parseFloat(e.target.value)})}
-                            className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-                        />
-                        <div className="flex justify-between text-xs text-slate-400 mt-2">
-                            <span>0.5x</span>
-                            <span>1.0x</span>
-                            <span>2.0x</span>
-                        </div>
-                    </div>
-                </div>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full mx-4">
+            <div className="flex justify-between items-center mb-6">
+              <h3 className="text-lg font-bold">Playback Settings</h3>
+              <button onClick={() => setShowSettings(false)}>
+                <X className="w-5 h-5" />
+              </button>
             </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Playback Speed: {settings.playbackSpeed}x
+                </label>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="2"
+                  step="0.1"
+                  value={settings.playbackSpeed}
+                  onChange={(e) => onUpdateSettings({
+                    ...settings,
+                    playbackSpeed: parseFloat(e.target.value),
+                  })}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                  <span>0.5x</span>
+                  <span>2.0x</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
       {/* Note Modal */}
       {showNoteModal && (
-           <div className="absolute inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-               <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl overflow-hidden transform transition-all scale-100">
-                   <div className="bg-indigo-600 p-4 flex justify-between items-center">
-                       <h3 className="text-white font-semibold flex items-center gap-2">
-                           <Mic className="w-4 h-4" /> Add a Note
-                       </h3>
-                       <button onClick={() => setShowNoteModal(false)} className="text-indigo-200 hover:text-white">
-                           <X className="w-5 h-5" />
-                       </button>
-                   </div>
-                   <div className="p-6">
-                       <div className="mb-4 text-xs text-indigo-500 font-medium bg-indigo-50 inline-block px-2 py-1 rounded">
-                           Timestamp: {formatTime(currentBufferOffsetRef.current)}
-                       </div>
-                       <textarea 
-                           autoFocus
-                           value={noteContent}
-                           onChange={(e) => setNoteContent(e.target.value)}
-                           placeholder="Type your thought here..."
-                           className="w-full h-32 resize-none p-4 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none mb-4 text-slate-700"
-                       />
-                       <div className="flex justify-end gap-3">
-                           <Button variant="outline" onClick={() => setShowNoteModal(false)}>Cancel</Button>
-                           <Button onClick={saveNote}>Save Note</Button>
-                       </div>
-                   </div>
-               </div>
-           </div>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full mx-4">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-bold">Add Note</h3>
+              <button onClick={() => setShowNoteModal(false)}>
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-600 mb-4">
+              At {formatTime(currentTime)} • Paragraph {currentParagraphIndex + 1}
+            </p>
+
+            <textarea
+              value={noteContent}
+              onChange={(e) => setNoteContent(e.target.value)}
+              placeholder="Enter your note..."
+              className="w-full px-4 py-3 border border-slate-300 rounded-xl resize-none focus:ring-2 focus:ring-indigo-500 outline-none"
+              rows={4}
+              autoFocus
+            />
+
+            <div className="flex gap-3 mt-4">
+              <Button
+                variant="secondary"
+                onClick={() => setShowNoteModal(false)}
+                className="flex-1"
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleAddNote} className="flex-1">
+                Save Note
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -108,7 +108,8 @@ const App: React.FC = () => {
 
       {view === 'SCANNER' && (
         <Scanner 
-          user={user} 
+          user={user}
+          voiceGender={settings.voiceGender}
           onComplete={handleScanComplete} 
           onCancel={() => setView('DASHBOARD')}
         />

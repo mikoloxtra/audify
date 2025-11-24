@@ -1,3 +1,5 @@
+// ===== USER & AUTH =====
+
 export interface User {
   id: string;
   email: string;
@@ -5,35 +7,9 @@ export interface User {
   photoURL?: string | null;
 }
 
-export interface Note {
-  id: string;
-  pageNumber: number; // Which page this note belongs to
-  paragraphIndex: number; // The index of the paragraph within the page
-  timestamp: number; // Seconds relative to the start of the paragraph
-  content: string;
-  createdAt: string;
-}
-
-export interface Page {
-  pageNumber: number; // 1-indexed page number
-  imageUrl: string; // Download URL for the page image
-  imagePath: string; // Storage path for the page image
-  text: string; // Full OCR text for this page
-  paragraphs: string[]; // Split paragraphs for this page
-  audioPaths: string[]; // Storage paths for cached audio per paragraph
-  audioUrls: string[]; // Download URLs for cached audio per paragraph
-}
-
-export interface Document {
-  id: string;
-  userId: string;
-  title: string;
-  pages: Page[]; // Array of pages in the document
-  currentPage: number; // Current page number (1-indexed)
-  currentParagraph: number; // Current paragraph index within current page
-  createdAt: string;
-  updatedAt?: string;
-  notes: Note[];
+export interface AppSettings {
+  voiceGender: VoiceGender;
+  playbackSpeed: number; // 0.5x to 2.0x
 }
 
 export enum VoiceGender {
@@ -41,9 +17,93 @@ export enum VoiceGender {
   FEMALE = 'FEMALE',
 }
 
-export interface AppSettings {
-  voiceGender: VoiceGender;
-  playbackSpeed: number; // 0.5x to 2.0x
+export type ViewState = 'AUTH' | 'DASHBOARD' | 'SCANNER' | 'PLAYER' | 'PROFILE';
+
+// ===== NEW REFACTORED DATA MODEL =====
+
+export interface Document {
+  id: string;
+  userId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  
+  // Source images
+  sourceImages: SourceImage[];
+  
+  // Processed content
+  content: ProcessedContent;
+  
+  // Audio
+  audio: AudioData;
+  
+  // Playback state
+  playback: PlaybackState;
+  
+  // User annotations
+  notes: Note[];
 }
 
-export type ViewState = 'AUTH' | 'DASHBOARD' | 'SCANNER' | 'PLAYER' | 'PROFILE';
+export interface SourceImage {
+  id: string;
+  storagePath: string;
+  downloadURL: string;
+  uploadedAt: string;
+  order: number; // For multi-image documents
+}
+
+export interface ProcessedContent {
+  fullText: string; // Raw OCR output
+  paragraphs: Paragraph[];
+  totalParagraphs: number;
+  totalCharacters: number;
+  language?: string;
+  processedAt: string;
+}
+
+export interface Paragraph {
+  id: string;
+  index: number;
+  text: string;
+  startTime: number; // Start time in audio (seconds)
+  endTime: number;   // End time in audio (seconds)
+  characterStart: number; // Character position in fullText
+  characterEnd: number;
+}
+
+export interface AudioData {
+  storagePath: string;
+  downloadURL: string;
+  duration: number; // Total duration in seconds
+  format: 'pcm' | 'mp3' | 'wav';
+  sampleRate: number;
+  generatedAt: string;
+  voiceGender: VoiceGender;
+}
+
+export interface PlaybackState {
+  currentTime: number; // Current playback position in seconds
+  currentParagraphIndex: number;
+  lastPlayedAt: string;
+  isCompleted: boolean;
+  completionPercentage: number;
+}
+
+export interface Note {
+  id: string;
+  timestamp: number; // Time in audio (seconds)
+  paragraphIndex: number;
+  content: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+// ===== PROCESSING =====
+
+export interface ProcessingStatus {
+  stage: 'uploading' | 'ocr' | 'audio' | 'saving' | 'complete' | 'error';
+  progress: number; // 0-100
+  message: string;
+  currentStep?: number;
+  totalSteps?: number;
+}

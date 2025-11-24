@@ -1,41 +1,27 @@
 import React, { useState, useRef } from 'react';
-import { extractTextFromImage } from '../services/geminiService';
-import { User, Document, Page } from '../types';
-import { saveDocument, uploadSourceAsset, MAX_FILE_SIZE } from '../services/storageService';
+import { User, ProcessingStatus, VoiceGender } from '../types';
+import { processDocument } from '../services/processingService';
 import { Button } from './Button';
-import { v4 as uuidv4 } from 'uuid';
-import { Upload, FileText, CheckCircle, XCircle, AlertCircle, Plus, X as XIcon } from 'lucide-react';
+import { Upload, FileText, CheckCircle, XCircle, AlertCircle, Loader2, Plus, X as XIcon } from 'lucide-react';
+import { MAX_FILE_SIZE } from '../services/storageService';
 
 interface ScannerProps {
   user: User;
+  voiceGender: VoiceGender;
   onComplete: () => void;
   onCancel: () => void;
 }
 
-const fileToBase64 = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result === 'string') {
-        const [, base64Data] = result.split(',');
-        resolve(base64Data ?? '');
-      } else {
-        reject(new Error('Unsupported file format'));
-      }
-    };
-    reader.onerror = () => reject(new Error('Failed to read file.'));
-    reader.readAsDataURL(file);
-  });
-};
-
-export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) => {
+export const Scanner: React.FC<ScannerProps> = ({ user, voiceGender, onComplete, onCancel }) => {
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [processingStatus, setProcessingStatus] = useState<string>('');
-  const [error, setError] = useState('');
   const [title, setTitle] = useState('');
+  const [error, setError] = useState('');
+  
+  // Processing state
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -68,139 +54,93 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
       setTitle(validFiles[0].name.split('.')[0]);
     }
     setError('');
+    
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
   };
 
   const removeFile = (index: number) => {
     const newFiles = files.filter((_, i) => i !== index);
     const newPreviews = previews.filter((_, i) => i !== index);
+    
+    // Revoke object URL to free memory
+    URL.revokeObjectURL(previews[index]);
+    
     setFiles(newFiles);
     setPreviews(newPreviews);
   };
 
-  const processParagraphs = (text: string): string[] => {
-    let paragraphs = text.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
-
-    paragraphs = paragraphs.flatMap((p) => {
-      if (p.length < 1000) return [p];
-
-      const sentences = p.match(/[^.!?]+[.!?]+(?=\s|$)/g) || [p];
-      const chunks: string[] = [];
-      let currentChunk = '';
-
-      for (const s of sentences) {
-        if ((currentChunk + s).length > 1000) {
-          if (currentChunk) chunks.push(currentChunk);
-          currentChunk = s;
-        } else {
-          currentChunk += s;
-        }
-      }
-      if (currentChunk) chunks.push(currentChunk);
-
-      return chunks.flatMap((c) => {
-        if (c.length < 1500) return [c];
-        return c.match(/.{1,1000}/g) || [c];
-      });
-    });
-
-    return paragraphs;
-  };
-
   const handleProcess = async () => {
-    if (files.length === 0 || !title) return;
+    if (files.length === 0 || !title.trim()) {
+      setError('Please select at least one image and enter a title.');
+      return;
+    }
 
     setIsProcessing(true);
     setError('');
-    setProcessingStatus(`Processing ${files.length} page(s)...`);
-    console.log('[Scanner] Starting multi-page OCR pipeline', { pageCount: files.length });
+    setProcessingStatus({
+      stage: 'uploading',
+      progress: 0,
+      message: 'Starting...',
+    });
 
     try {
-      const pages: Page[] = [];
-
-      // Process each file as a page
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        setProcessingStatus(`Processing page ${i + 1} of ${files.length}...`);
-        console.log(`[Scanner] Processing page ${i + 1}`, {
-          fileName: file.name,
-          fileSize: file.size,
-        });
-
-        // Upload image to storage
-        const { storagePath, downloadURL } = await uploadSourceAsset(user.id, file);
-        console.log(`[Scanner] Page ${i + 1} uploaded to storage`);
-
-        // Extract text via OCR
-        const base64Data = await fileToBase64(file);
-        const text = await extractTextFromImage(base64Data, file.type);
-        console.log(`[Scanner] Page ${i + 1} OCR complete`);
-
-        if (!text || text.trim().length === 0) {
-          console.warn(`[Scanner] Page ${i + 1} has no text, skipping`);
-          continue;
+      await processDocument(
+        user.id,
+        files,
+        title.trim(),
+        voiceGender,
+        (status) => {
+          setProcessingStatus(status);
         }
+      );
 
-        // Split into paragraphs
-        const paragraphs = processParagraphs(text);
-        console.log(`[Scanner] Page ${i + 1} has ${paragraphs.length} paragraphs`);
-
-        // Create page object
-        const page: Page = {
-          pageNumber: i + 1,
-          imageUrl: downloadURL,
-          imagePath: storagePath,
-          text: text,
-          paragraphs: paragraphs,
-          audioPaths: [],
-          audioUrls: [],
-        };
-
-        pages.push(page);
-      }
-
-      if (pages.length === 0) {
-        throw new Error('No text found in any of the uploaded images.');
-      }
-
-      setProcessingStatus('Saving document...');
-
-      const newDoc: Document = {
-        id: uuidv4(),
-        userId: user.id,
-        title: title,
-        pages: pages,
-        currentPage: 1,
-        currentParagraph: 0,
-        createdAt: new Date().toISOString(),
-        notes: [],
-      };
-
-      await saveDocument(newDoc);
-      console.log('[Scanner] Document persisted to Firestore', {
-        documentId: newDoc.id,
-        pageCount: pages.length,
-      });
+      // Success! Clean up and redirect
+      previews.forEach(url => URL.revokeObjectURL(url));
       onComplete();
     } catch (err: any) {
-      console.error('[Scanner] Failed to process document', err);
-      setError(err.message || 'Failed to process document.');
+      console.error('[Scanner] Processing error:', err);
+      setError(err.message || 'Failed to process document. Please try again.');
+      setProcessingStatus({
+        stage: 'error',
+        progress: 0,
+        message: err.message || 'Processing failed',
+      });
     } finally {
       setIsProcessing(false);
-      setProcessingStatus('');
+    }
+  };
+
+  const getStageLabel = (stage: string): string => {
+    switch (stage) {
+      case 'uploading': return 'Uploading Images';
+      case 'ocr': return 'Extracting Text (OCR)';
+      case 'audio': return 'Generating Audio';
+      case 'saving': return 'Saving Audiobook';
+      case 'complete': return 'Complete';
+      case 'error': return 'Error';
+      default: return 'Processing';
     }
   };
 
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="mb-6 flex items-center justify-between">
-        <h2 className="text-2xl font-bold text-slate-900">Scan Document</h2>
-        <button onClick={onCancel} className="text-slate-500 hover:text-slate-700">
+        <h2 className="text-2xl font-bold text-slate-900">Create Audiobook</h2>
+        <button 
+          onClick={onCancel} 
+          className="text-slate-500 hover:text-slate-700"
+          disabled={isProcessing}
+        >
           <XCircle className="w-6 h-6" />
         </button>
       </div>
 
       <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden p-8">
-        {files.length === 0 ? (
+        {/* File Upload Section */}
+        {!isProcessing && files.length === 0 && (
           <div 
             className="border-2 border-dashed border-slate-300 rounded-xl p-12 text-center hover:bg-slate-50 transition-colors cursor-pointer"
             onClick={() => fileInputRef.current?.click()}
@@ -208,9 +148,18 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
             <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
               <Upload className="w-8 h-8" />
             </div>
-            <h3 className="text-lg font-medium text-slate-900 mb-1">Upload Document Pages</h3>
-            <p className="text-slate-500 text-sm mb-4">Select one or multiple images (PNG, JPG up to 10MB each)</p>
-            <Button size="sm" variant="secondary" onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}>
+            <h3 className="text-lg font-medium text-slate-900 mb-1">Upload Document Images</h3>
+            <p className="text-slate-500 text-sm mb-4">
+              Select one or multiple images (PNG, JPG up to 10MB each)
+            </p>
+            <Button 
+              size="sm" 
+              variant="secondary" 
+              onClick={(e) => { 
+                e.stopPropagation(); 
+                fileInputRef.current?.click(); 
+              }}
+            >
               Select Files
             </Button>
             <input 
@@ -222,27 +171,36 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
               onChange={handleFileChange}
             />
           </div>
-        ) : (
+        )}
+
+        {/* Files Selected - Show Preview & Title Input */}
+        {!isProcessing && files.length > 0 && (
           <div className="space-y-6">
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-700 mb-1">Document Title</label>
+            {/* Title Input */}
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">
+                Audiobook Title
+              </label>
               <input 
                 type="text" 
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 className="w-full px-4 py-2 bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none"
-                placeholder="Enter document title..."
+                placeholder="Enter audiobook title..."
+                disabled={isProcessing}
               />
             </div>
 
+            {/* Image Previews */}
             <div>
               <div className="flex items-center justify-between mb-3">
                 <label className="block text-sm font-medium text-slate-700">
-                  Pages ({files.length})
+                  Images ({files.length})
                 </label>
                 <button
                   onClick={() => fileInputRef.current?.click()}
                   className="text-xs text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
+                  disabled={isProcessing}
                 >
                   <Plus className="w-3 h-3" /> Add More
                 </button>
@@ -253,7 +211,7 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
                   <div key={index} className="relative group">
                     <img 
                       src={preview} 
-                      alt={`Page ${index + 1}`} 
+                      alt={`Image ${index + 1}`} 
                       className="w-full h-32 object-cover rounded-lg border border-slate-200 shadow-sm" 
                     />
                     <div className="absolute top-1 left-1 bg-black/60 text-white text-xs px-2 py-0.5 rounded">
@@ -262,6 +220,7 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
                     <button
                       onClick={() => removeFile(index)}
                       className="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                      disabled={isProcessing}
                     >
                       <XIcon className="w-3 h-3" />
                     </button>
@@ -279,6 +238,7 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
               />
             </div>
 
+            {/* Error Display */}
             {error && (
               <div className="p-4 bg-red-50 text-red-700 rounded-xl flex items-center gap-3">
                 <AlertCircle className="w-5 h-5 flex-shrink-0" />
@@ -286,37 +246,88 @@ export const Scanner: React.FC<ScannerProps> = ({ user, onComplete, onCancel }) 
               </div>
             )}
             
+            {/* Process Button */}
             <div className="flex gap-3 pt-4">
               <Button 
                 onClick={handleProcess} 
                 isLoading={isProcessing} 
                 className="flex-1"
-                disabled={files.length === 0 || !title}
+                disabled={files.length === 0 || !title.trim() || isProcessing}
               >
-                {isProcessing ? processingStatus || 'Processing...' : 'Convert to Audiobook'}
+                {isProcessing ? 'Processing...' : 'Create Audiobook'}
               </Button>
             </div>
-            
-            {isProcessing && processingStatus && (
-              <p className="text-center text-xs text-slate-400">
-                {processingStatus}
+          </div>
+        )}
+
+        {/* Processing State */}
+        {isProcessing && processingStatus && (
+          <div className="space-y-6">
+            <div className="text-center">
+              <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                {processingStatus.stage === 'complete' ? (
+                  <CheckCircle className="w-8 h-8 text-green-600" />
+                ) : processingStatus.stage === 'error' ? (
+                  <XCircle className="w-8 h-8 text-red-600" />
+                ) : (
+                  <Loader2 className="w-8 h-8 animate-spin" />
+                )}
+              </div>
+              
+              <h3 className="text-lg font-semibold text-slate-900 mb-2">
+                {getStageLabel(processingStatus.stage)}
+              </h3>
+              
+              <p className="text-sm text-slate-600 mb-4">
+                {processingStatus.message}
               </p>
-            )}
+
+              {/* Progress Bar */}
+              <div className="w-full bg-slate-200 rounded-full h-2 mb-2">
+                <div 
+                  className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${processingStatus.progress}%` }}
+                />
+              </div>
+              
+              <p className="text-xs text-slate-500">
+                {Math.round(processingStatus.progress)}%
+                {processingStatus.currentStep && processingStatus.totalSteps && (
+                  <span> • Step {processingStatus.currentStep} of {processingStatus.totalSteps}</span>
+                )}
+              </p>
+            </div>
+
+            {/* Image Grid (smaller during processing) */}
+            <div className="grid grid-cols-4 gap-2">
+              {previews.map((preview, index) => (
+                <img 
+                  key={index}
+                  src={preview} 
+                  alt={`Image ${index + 1}`} 
+                  className="w-full h-20 object-cover rounded-lg border border-slate-200 opacity-50" 
+                />
+              ))}
+            </div>
           </div>
         )}
       </div>
       
-      <div className="mt-6 p-4 bg-indigo-50 rounded-xl border border-indigo-100">
-        <h4 className="text-sm font-semibold text-indigo-900 mb-2 flex items-center">
-          <FileText className="w-4 h-4 mr-2" />
-          Tips for best results
-        </h4>
-        <ul className="text-xs text-indigo-700 space-y-1 list-disc pl-4">
-          <li>Ensure the image is well-lit and text is clear.</li>
-          <li>Avoid shadows covering the text.</li>
-          <li>Crop the image to the document edges if possible.</li>
-        </ul>
-      </div>
+      {/* Tips Section */}
+      {!isProcessing && (
+        <div className="mt-6 p-4 bg-indigo-50 rounded-xl border border-indigo-100">
+          <h4 className="text-sm font-semibold text-indigo-900 mb-2 flex items-center">
+            <FileText className="w-4 h-4 mr-2" />
+            Tips for best results
+          </h4>
+          <ul className="text-xs text-indigo-700 space-y-1 list-disc pl-4">
+            <li>Ensure images are well-lit and text is clear</li>
+            <li>Avoid shadows covering the text</li>
+            <li>Crop images to document edges if possible</li>
+            <li>Upload pages in the correct order</li>
+          </ul>
+        </div>
+      )}
     </div>
   );
 };
