@@ -17,4 +17,4 @@
 - Save user notes and timestamp to firebase
 - Playback should autocontinue after user saves a note
 - audio note feature should work, recording should work the way voice notes work in whatsapp all data should be stored in db, lets brainstorm how transcribing should work whether to use gemini or some API
-- For multiple books/pages, do a pro/con list of allowing users batch upload multiple files and making the logic to scan all of them or calling smallpdf api to sqash them into one file and then scanning it.
+- For multiple books/pages, do a pro/con list of allowing users batch upload multiple files and making the logic to scan all of them or calling smallpdf api to sqash them into one file and then scanning it. Same with file type, either we allow the app to accept multiple file types or allow the user to convert the file to pdf or image before uploading to audify
